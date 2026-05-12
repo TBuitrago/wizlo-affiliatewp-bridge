@@ -1,9 +1,11 @@
 <?php
 /**
  * Plugin Name: Wizlo → AffiliateWP Bridge
- * Description: Recibe webhooks de Wizlo y crea referidos en AffiliateWP. Soporta forms.coupon_used (primario), order.updated (lifecycle), y detección oportunista de affiliate_id en customFields/metadata.
+ * Plugin URI:  https://github.com/TBuitrago/wizlo-affiliatewp-bridge
+ * Description: Receives webhooks from Wizlo and creates referrals in AffiliateWP. Supports forms.coupon_used (primary), order.updated (lifecycle), and opportunistic affiliate_id detection in customFields/metadata.
  * Version:     2.0.0
- * Author:      Tu equipo
+ * Author:      Tomas Buitrago
+ * Author URI:  https://github.com/TBuitrago
  * Requires PHP: 7.4
  * License:     GPL-2.0+
  */
@@ -55,7 +57,7 @@ class Wizlo_AffiliateWP_Bridge {
         $raw_body  = $request->get_body();
         $signature = $request->get_header( 'X-Webhook-Signature' );
 
-        // Si Wizlo configuró un headerKey diferente, tómalo también de otros headers comunes.
+        // If Wizlo configured a different headerKey, also read it from other common headers.
         if ( empty( $signature ) ) {
             foreach ( array( 'X-Wizlo-Signature', 'X-Signature', 'Signature' ) as $h ) {
                 $val = $request->get_header( $h );
@@ -132,8 +134,8 @@ class Wizlo_AffiliateWP_Bridge {
      * ================================================================== */
 
     /**
-     * forms.coupon_used — evento PRINCIPAL de atribución.
-     * Trae: coupon_code, patient_email, order_id, order_number, order_total, currency.
+     * forms.coupon_used — PRIMARY attribution event.
+     * Carries: coupon_code, patient_email, order_id, order_number, order_total, currency.
      */
     private function handle_coupon_used( $payload ) {
 
@@ -172,8 +174,8 @@ class Wizlo_AffiliateWP_Bridge {
     }
 
     /**
-     * forms.completed — solo crea referido si detectamos affiliate_id en customFields/metadata.
-     * NO trae monto; se actualizará al recibir order.updated con grand_total.
+     * forms.completed — only creates a referral if affiliate_id is detected in customFields/metadata.
+     * Does NOT carry an amount; it will be updated upon receiving order.updated with grand_total.
      */
     private function handle_forms_completed( $payload ) {
 
@@ -210,7 +212,7 @@ class Wizlo_AffiliateWP_Bridge {
     }
 
     /**
-     * forms.product_selected — emitido 2 veces. Solo procesamos cuando paid + affiliate_id propagado.
+     * forms.product_selected — emitted twice. Only processed when paid + affiliate_id is propagated.
      */
     private function handle_product_selected( $payload ) {
 
@@ -227,8 +229,8 @@ class Wizlo_AffiliateWP_Bridge {
     }
 
     /**
-     * order.updated — actualiza lifecycle del referido.
-     * Payload camelCase con order_details[] (array, puede traer varias órdenes).
+     * order.updated — updates the referral lifecycle.
+     * camelCase payload with order_details[] (array, may carry multiple orders).
      */
     private function handle_order_updated( $payload ) {
 
@@ -264,7 +266,7 @@ class Wizlo_AffiliateWP_Bridge {
                 continue;
             }
 
-            // Backfill amount si fue creado con 0 (caso forms.completed sin monto).
+            // Backfill amount if created with 0 (forms.completed case without amount).
             if ( $referral->amount == 0 && $grand_total !== null && $grand_total > 0 ) {
                 $new_amount = function_exists( 'affwp_calc_referral_amount' )
                     ? affwp_calc_referral_amount( $grand_total, $referral->affiliate_id, $referral->referral_id, '', self::REF_CONTEXT )
@@ -417,7 +419,7 @@ class Wizlo_AffiliateWP_Bridge {
             'expected_hex'    => $hex,
             'expected_base64' => $base64,
             'body_length'     => strlen( $body ),
-            'hint'            => 'Compara received con expected_hex o expected_base64 para saber qué formato usa Wizlo.',
+            'hint'            => 'Compare received with expected_hex or expected_base64 to determine the format Wizlo is using.',
         ) );
     }
 
@@ -529,9 +531,9 @@ class Wizlo_AffiliateWP_Bridge {
     }
 
     /**
-     * Busca recursivamente en TODO el payload cualquier key que parezca affiliate_id.
-     * Sirve para detectar customFields/metadata propagados desde iframe embed sin saber
-     * dónde exactamente los pone Wizlo.
+     * Recursively searches the ENTIRE payload for any key that looks like affiliate_id.
+     * Useful for detecting customFields/metadata propagated from an iframe embed without
+     * knowing where exactly Wizlo places them.
      */
     private function find_affiliate_id_anywhere( $data ) {
         $candidates = array( 'affiliate_id', 'affiliateId', 'affiliate', 'aff_id', 'affId' );
@@ -607,7 +609,7 @@ class Wizlo_AffiliateWP_Bridge {
 
         if ( isset( $_GET['clear_log'] ) && check_admin_referer( 'wizlo_clear_log' ) ) {
             delete_option( self::OPTION_LOG );
-            echo '<div class="notice notice-success"><p>Log limpiado.</p></div>';
+            echo '<div class="notice notice-success"><p>Log cleared.</p></div>';
         }
 
         $webhook_url    = rest_url( self::REST_NAMESPACE . self::REST_ROUTE );
@@ -621,19 +623,19 @@ class Wizlo_AffiliateWP_Bridge {
         <div class="wrap">
             <h1>Wizlo → AffiliateWP Bridge <span style="font-size:13px;color:#666;">v2.0.0</span></h1>
 
-            <h2>1. URL del webhook</h2>
-            <p>Registra esta URL en Wizlo (<code>POST /tenant/webhooks</code>):</p>
+            <h2>1. Webhook URL</h2>
+            <p>Register this URL in Wizlo (<code>POST /tenant/webhooks</code>):</p>
             <p><code style="padding:8px;background:#f0f0f1;display:inline-block;"><?php echo esc_html( $webhook_url ); ?></code></p>
 
-            <h2>2. Eventos recomendados</h2>
+            <h2>2. Recommended Events</h2>
             <ul style="list-style:disc;padding-left:20px;">
-                <li><strong>forms.coupon_used</strong> — atribución principal (trae cupón, monto, order_id)</li>
-                <li><strong>order.updated</strong> (módulo orders) — transiciones pending → unpaid → rejected</li>
-                <li><strong>forms.completed</strong> — opcional, solo si usas iframe + customFields</li>
-                <li><strong>forms.product_selected</strong> — opcional, alternativa sin cupón en estado <code>paid</code></li>
+                <li><strong>forms.coupon_used</strong> — primary attribution (carries coupon, amount, order_id)</li>
+                <li><strong>order.updated</strong> (orders module) — transitions pending → unpaid → rejected</li>
+                <li><strong>forms.completed</strong> — optional, only if using iframe + customFields</li>
+                <li><strong>forms.product_selected</strong> — optional, alternative without coupon in <code>paid</code> state</li>
             </ul>
 
-            <h2>3. Secret HMAC</h2>
+            <h2>3. HMAC Secret</h2>
             <form method="post" action="options.php">
                 <?php settings_fields( 'wizlo_bridge' ); ?>
                 <table class="form-table">
@@ -648,10 +650,10 @@ class Wizlo_AffiliateWP_Bridge {
                                 <?php disabled( $secret_defined ); ?>
                             >
                             <?php if ( $secret_defined ) : ?>
-                                <p class="description">Definido vía <code>WIZLO_WEBHOOK_SECRET</code> en wp-config.php.</p>
+                                <p class="description">Defined via <code>WIZLO_WEBHOOK_SECRET</code> in wp-config.php.</p>
                             <?php else : ?>
                                 <p class="description">
-                                    Recomendado: <code>define( 'WIZLO_WEBHOOK_SECRET', 'tu-secret' );</code> en <code>wp-config.php</code>.
+                                    Recommended: <code>define( 'WIZLO_WEBHOOK_SECRET', 'your-secret' );</code> in <code>wp-config.php</code>.
                                 </p>
                             <?php endif; ?>
                         </td>
@@ -661,24 +663,24 @@ class Wizlo_AffiliateWP_Bridge {
             </form>
 
             <h2 style="display:flex;justify-content:space-between;align-items:center;">
-                <span>4. Actividad reciente (<?php echo count( $log ); ?>)</span>
+                <span>4. Recent Activity (<?php echo count( $log ); ?>)</span>
                 <?php if ( ! empty( $log ) ) : ?>
-                    <a href="<?php echo esc_url( $clear_url ); ?>" class="button">Limpiar log</a>
+                    <a href="<?php echo esc_url( $clear_url ); ?>" class="button">Clear log</a>
                 <?php endif; ?>
             </h2>
             <p class="description">
-                Aquí ves el payload crudo. Útil para validar si <code>customFields</code> propaga desde el iframe.
+                Here you can see the raw payload. Useful to validate if <code>customFields</code> propagates from the iframe.
             </p>
             <?php if ( empty( $log ) ) : ?>
-                <p>Aún no se han recibido webhooks.</p>
+                <p>No webhooks received yet.</p>
             <?php else : ?>
                 <table class="wp-list-table widefat striped">
                     <thead>
                         <tr>
-                            <th style="width:150px;">Hora</th>
-                            <th style="width:80px;">Nivel</th>
-                            <th style="width:220px;">Mensaje</th>
-                            <th>Contexto</th>
+                            <th style="width:150px;">Time</th>
+                            <th style="width:80px;">Level</th>
+                            <th style="width:220px;">Message</th>
+                            <th>Context</th>
                         </tr>
                     </thead>
                     <tbody>
