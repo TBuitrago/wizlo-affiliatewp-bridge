@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Wizlo → AffiliateWP Bridge
  * Plugin URI:  https://github.com/TBuitrago/wizlo-affiliatewp-bridge
- * Description: Receives webhooks from Wizlo and creates referrals in AffiliateWP. Supports forms.coupon_used (primary), order.updated (lifecycle), cookie-based attribution via forms.progress_saved + forms.completed, and provides a [wizlo_form] shortcode to embed Wizlo forms with automatic affwp_ref cookie propagation.
- * Version:     2.2.0
+ * Description: Receives webhooks from Wizlo and creates referrals in AffiliateWP. Supports forms.coupon_used (primary), order.updated (lifecycle), cookie-based attribution via forms.progress_saved + forms.completed, provides a [wizlo_form] shortcode, and auto-rewrites WooCommerce external URLs pointing to Wizlo so the affiliate cookie survives.
+ * Version:     2.3.0
  * Author:      Tomas Buitrago
  * Author URI:  https://github.com/TBuitrago
  * Requires PHP: 7.4
@@ -16,14 +16,20 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Wizlo_AffiliateWP_Bridge {
 
-    const REST_NAMESPACE = 'wizlo/v1';
-    const REST_ROUTE     = '/conversion';
-    const OPTION_SECRET  = 'wizlo_webhook_secret';
-    const OPTION_LOG     = 'wizlo_webhook_log';
-    const OPTION_ENV     = 'wizlo_environment';
-    const REF_CONTEXT    = 'wizlo';
-    const LOG_MAX        = 100;
-    const SHORTCODE_TAG  = 'wizlo_form';
+    const REST_NAMESPACE      = 'wizlo/v1';
+    const REST_ROUTE          = '/conversion';
+    const OPTION_SECRET       = 'wizlo_webhook_secret';
+    const OPTION_LOG          = 'wizlo_webhook_log';
+    const OPTION_ENV          = 'wizlo_environment';
+    const OPTION_AUTO_REWRITE = 'wizlo_auto_rewrite';
+    const OPTION_INTAKE_PATH  = 'wizlo_intake_path';
+    const REF_CONTEXT         = 'wizlo';
+    const LOG_MAX             = 100;
+    const SHORTCODE_TAG       = 'wizlo_form';
+
+    // Regex to match Wizlo form URLs (both prod and UAT) with a bcrypt-style token.
+    // Capture group 2 = bare token.
+    const URL_PATTERN = '#https?://(app|uat)\.wizlo\.com/form-submission\?token=(\$2[abxy]\$\d{2}\$[A-Za-z0-9./]{53})#i';
 
     /** @var bool Tracks if any [wizlo_form] shortcode rendered on this request. */
     private $shortcode_was_used = false;
@@ -34,6 +40,25 @@ class Wizlo_AffiliateWP_Bridge {
         add_action( 'admin_init', array( $this, 'register_settings' ) );
         add_action( 'init', array( $this, 'register_shortcode' ) );
         add_action( 'wp_footer', array( $this, 'print_iframe_script_once' ) );
+
+        // Auto-rewrite WooCommerce external URLs that point to Wizlo so the
+        // affwp_ref cookie survives (the user never leaves arsynl.com).
+        if ( $this->is_rewrite_enabled() ) {
+            // Simple external products
+            add_filter( 'woocommerce_product_get_product_url',    array( $this, 'filter_string' ), 20, 1 );
+            add_filter( 'woocommerce_product_add_to_cart_url',    array( $this, 'filter_string' ), 20, 1 );
+
+            // Variations (wc-external-variations plugin and any other source)
+            add_filter( 'woocommerce_available_variation',        array( $this, 'filter_variation_data' ), 20, 3 );
+
+            // Frontend safety net: rewrites any wizlo.com anchor on the page
+            // (including those injected by JS for variation selection).
+            add_action( 'wp_footer', array( $this, 'print_rewriter_script_once' ), 5 );
+        }
+    }
+
+    private function is_rewrite_enabled() {
+        return (bool) get_option( self::OPTION_AUTO_REWRITE, 1 );
     }
 
     /* =====================================================================
@@ -643,6 +668,131 @@ class Wizlo_AffiliateWP_Bridge {
     }
 
     /* =====================================================================
+     * External URL rewriter
+     *
+     * Replaces any Wizlo `https://(app|uat).wizlo.com/form-submission?token=...`
+     * URL produced by WooCommerce (simple external products and variations)
+     * with the local intake page `/intake/?token=...` so the affwp_ref cookie
+     * stays alive and the user never leaves the site.
+     * ================================================================== */
+
+    /**
+     * Returns the local URL that should replace Wizlo's external URL,
+     * or NULL if the input does not match the Wizlo pattern.
+     */
+    private function rewrite_url( $url ) {
+        if ( ! is_string( $url ) || $url === '' ) {
+            return null;
+        }
+        if ( ! preg_match( self::URL_PATTERN, $url, $m ) ) {
+            return null;
+        }
+        $token = $m[2];
+        return $this->intake_page_url() . '?token=' . $token;
+    }
+
+    /**
+     * Returns the configured intake page URL (absolute) without query string.
+     */
+    private function intake_page_url() {
+        $path = trim( (string) get_option( self::OPTION_INTAKE_PATH, '/intake/' ), '/' );
+        return trailingslashit( home_url( '/' . $path ) );
+    }
+
+    /**
+     * Filter for any WooCommerce URL hook that receives a plain string.
+     */
+    public function filter_string( $url ) {
+        $new = $this->rewrite_url( $url );
+        return $new !== null ? $new : $url;
+    }
+
+    /**
+     * Filter for `woocommerce_available_variation` — receives the variation
+     * data array. We walk every string value and rewrite any Wizlo URL found.
+     */
+    public function filter_variation_data( $variation_data, $product = null, $variation = null ) {
+        if ( ! is_array( $variation_data ) ) {
+            return $variation_data;
+        }
+        array_walk_recursive( $variation_data, array( $this, 'walk_rewrite' ) );
+        return $variation_data;
+    }
+
+    /**
+     * Callback for array_walk_recursive — mutates string values in-place if
+     * they match the Wizlo URL pattern.
+     */
+    public function walk_rewrite( &$value ) {
+        if ( is_string( $value ) ) {
+            $new = $this->rewrite_url( $value );
+            if ( $new !== null ) {
+                $value = $new;
+            }
+        }
+    }
+
+    /**
+     * Client-side safety net. Catches Wizlo URLs that PHP filters missed
+     * (e.g., URLs injected later by variation-selection JS) by rewriting
+     * any anchor whose href points to a Wizlo form-submission URL.
+     */
+    public function print_rewriter_script_once() {
+        // Only on frontend pages where WooCommerce or product content could appear.
+        if ( is_admin() ) {
+            return;
+        }
+        $intake = $this->intake_page_url();
+        ?>
+        <script>
+        (function () {
+          var INTAKE = <?php echo wp_json_encode( $intake ); ?>;
+          var RE     = /https?:\/\/(?:app|uat)\.wizlo\.com\/form-submission\?token=(\$2[abxy]\$\d{2}\$[A-Za-z0-9.\/]{53})/i;
+
+          function rewriteHref(href) {
+            var m = href && href.match(RE);
+            return m ? (INTAKE + '?token=' + m[1]) : null;
+          }
+
+          function processAnchor(a) {
+            var href = a.getAttribute('href');
+            var n = rewriteHref(href);
+            if (n) a.setAttribute('href', n);
+          }
+
+          function scan(root) {
+            if (!root || !root.querySelectorAll) return;
+            var anchors = root.querySelectorAll('a[href*="wizlo.com/form-submission"]');
+            for (var i = 0; i < anchors.length; i++) processAnchor(anchors[i]);
+          }
+
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function () { scan(document); });
+          } else {
+            scan(document);
+          }
+
+          // Catch dynamically inserted nodes (variation selection updates the button).
+          if (typeof MutationObserver !== 'undefined') {
+            var mo = new MutationObserver(function (mutations) {
+              for (var i = 0; i < mutations.length; i++) {
+                var added = mutations[i].addedNodes;
+                for (var j = 0; j < added.length; j++) {
+                  var node = added[j];
+                  if (node.nodeType !== 1) continue;
+                  if (node.tagName === 'A') processAnchor(node);
+                  scan(node);
+                }
+              }
+            });
+            mo.observe(document.body, { childList: true, subtree: true });
+          }
+        })();
+        </script>
+        <?php
+    }
+
+    /* =====================================================================
      * Shortcode [wizlo_form]
      * ================================================================== */
 
@@ -859,10 +1009,35 @@ class Wizlo_AffiliateWP_Bridge {
             'sanitize_callback' => array( $this, 'sanitize_env' ),
             'default'           => 'production',
         ) );
+        register_setting( 'wizlo_bridge', self::OPTION_AUTO_REWRITE, array(
+            'type'              => 'boolean',
+            'sanitize_callback' => array( $this, 'sanitize_bool' ),
+            'default'           => 1,
+        ) );
+        register_setting( 'wizlo_bridge', self::OPTION_INTAKE_PATH, array(
+            'type'              => 'string',
+            'sanitize_callback' => array( $this, 'sanitize_intake_path' ),
+            'default'           => '/intake/',
+        ) );
     }
 
     public function sanitize_env( $value ) {
         return in_array( $value, array( 'production', 'sandbox' ), true ) ? $value : 'production';
+    }
+
+    public function sanitize_bool( $value ) {
+        return $value ? 1 : 0;
+    }
+
+    public function sanitize_intake_path( $value ) {
+        $value = trim( (string) $value );
+        if ( $value === '' ) {
+            return '/intake/';
+        }
+        // Allow only path-like input. Strip protocol/host if user paste a full URL.
+        $value = preg_replace( '#^https?://[^/]+#i', '', $value );
+        $value = '/' . trim( $value, '/' ) . '/';
+        return $value;
     }
 
     public function admin_page() {
@@ -884,7 +1059,7 @@ class Wizlo_AffiliateWP_Bridge {
         );
         ?>
         <div class="wrap">
-            <h1>Wizlo → AffiliateWP Bridge <span style="font-size:13px;color:#666;">v2.2.0</span></h1>
+            <h1>Wizlo → AffiliateWP Bridge <span style="font-size:13px;color:#666;">v2.3.0</span></h1>
 
             <h2>0. Environment</h2>
             <form method="post" action="options.php">
@@ -953,6 +1128,44 @@ class Wizlo_AffiliateWP_Bridge {
                         </td>
                     </tr>
                 </table>
+
+            <?php
+            $auto_rewrite_on = (bool) get_option( self::OPTION_AUTO_REWRITE, 1 );
+            $intake_path     = get_option( self::OPTION_INTAKE_PATH, '/intake/' );
+            $intake_url_full = $this->intake_page_url();
+            ?>
+            <h2>5. External URL Auto-Rewriter</h2>
+            <table class="form-table">
+                <tr>
+                    <th scope="row">Auto-rewrite</th>
+                    <td>
+                        <label>
+                            <input type="checkbox" name="<?php echo esc_attr( self::OPTION_AUTO_REWRITE ); ?>" value="1" <?php checked( $auto_rewrite_on, true ); ?>>
+                            Replace WooCommerce external URLs pointing to <code>app.wizlo.com</code> / <code>uat.wizlo.com</code> with the local intake page
+                        </label>
+                        <p class="description">
+                            Works for both simple external products and variations
+                            (including <code>wc-external-variations</code>). A frontend
+                            JS safety net rewrites any anchor injected dynamically.
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">Intake page path</th>
+                    <td>
+                        <input type="text"
+                            name="<?php echo esc_attr( self::OPTION_INTAKE_PATH ); ?>"
+                            value="<?php echo esc_attr( $intake_path ); ?>"
+                            class="regular-text"
+                            placeholder="/intake/">
+                        <p class="description">
+                            The local page that hosts <code>[wizlo_form]</code>.
+                            Wizlo URLs will be rewritten to:
+                            <code><?php echo esc_html( $intake_url_full ); ?>?token=&lt;token&gt;</code>
+                        </p>
+                    </td>
+                </tr>
+            </table>
 
             <h2>4. Form Shortcode</h2>
             <p>
