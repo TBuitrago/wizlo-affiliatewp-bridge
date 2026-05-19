@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Wizlo → AffiliateWP Bridge
  * Plugin URI:  https://github.com/TBuitrago/wizlo-affiliatewp-bridge
- * Description: Receives webhooks from Wizlo and creates referrals in AffiliateWP. Supports forms.coupon_used (primary), order.updated (lifecycle), and cookie-based attribution via forms.progress_saved + forms.completed.
- * Version:     2.1.0
+ * Description: Receives webhooks from Wizlo and creates referrals in AffiliateWP. Supports forms.coupon_used (primary), order.updated (lifecycle), cookie-based attribution via forms.progress_saved + forms.completed, and provides a [wizlo_form] shortcode to embed Wizlo forms with automatic affwp_ref cookie propagation.
+ * Version:     2.2.0
  * Author:      Tomas Buitrago
  * Author URI:  https://github.com/TBuitrago
  * Requires PHP: 7.4
@@ -20,13 +20,20 @@ class Wizlo_AffiliateWP_Bridge {
     const REST_ROUTE     = '/conversion';
     const OPTION_SECRET  = 'wizlo_webhook_secret';
     const OPTION_LOG     = 'wizlo_webhook_log';
+    const OPTION_ENV     = 'wizlo_environment';
     const REF_CONTEXT    = 'wizlo';
     const LOG_MAX        = 100;
+    const SHORTCODE_TAG  = 'wizlo_form';
+
+    /** @var bool Tracks if any [wizlo_form] shortcode rendered on this request. */
+    private $shortcode_was_used = false;
 
     public function __construct() {
         add_action( 'rest_api_init', array( $this, 'register_routes' ) );
         add_action( 'admin_menu', array( $this, 'add_admin_menu' ) );
         add_action( 'admin_init', array( $this, 'register_settings' ) );
+        add_action( 'init', array( $this, 'register_shortcode' ) );
+        add_action( 'wp_footer', array( $this, 'print_iframe_script_once' ) );
     }
 
     /* =====================================================================
@@ -636,6 +643,179 @@ class Wizlo_AffiliateWP_Bridge {
     }
 
     /* =====================================================================
+     * Shortcode [wizlo_form]
+     * ================================================================== */
+
+    public function register_shortcode() {
+        add_shortcode( self::SHORTCODE_TAG, array( $this, 'shortcode_handler' ) );
+    }
+
+    /**
+     * Renders a Wizlo form iframe.
+     *
+     * Attributes:
+     *  - token  (string, optional): bcrypt token from Wizlo. If empty, reads ?token= from URL.
+     *  - height (int, optional):    initial iframe height in px. Auto-resizes via postMessage. Default 900.
+     */
+    public function shortcode_handler( $atts ) {
+
+        $atts = shortcode_atts( array(
+            'token'  => '',
+            'height' => '900',
+        ), $atts, self::SHORTCODE_TAG );
+
+        // Token resolution: shortcode attribute first, then ?token= URL param.
+        $token = (string) $atts['token'];
+        if ( $token === '' && isset( $_GET['token'] ) ) {
+            $token = sanitize_text_field( wp_unslash( $_GET['token'] ) );
+        }
+
+        if ( ! $this->is_valid_token( $token ) ) {
+            // Admins see a hint; everyone else sees a neutral message.
+            if ( current_user_can( 'manage_options' ) ) {
+                return '<div style="padding:16px;border:2px solid #d63638;background:#fcf0f1;color:#d63638;font-family:sans-serif;">'
+                    . '<strong>Wizlo Bridge:</strong> missing or invalid token. '
+                    . 'Use <code>[wizlo_form token="..."]</code> or pass <code>?token=...</code> in the URL.'
+                    . '</div>';
+            }
+            return '<p>Form not available.</p>';
+        }
+
+        $origin    = $this->get_wizlo_origin();
+        $form_url  = $origin . '/form-submission?token=' . $token;
+        $iframe_id = 'wizlo-form-' . wp_generate_uuid4();
+        $height    = (int) $atts['height'];
+        if ( $height < 100 ) {
+            $height = 900;
+        }
+
+        $this->shortcode_was_used = true;
+
+        ob_start();
+        ?>
+        <iframe
+            id="<?php echo esc_attr( $iframe_id ); ?>"
+            class="wizlo-form-iframe"
+            data-wizlo-origin="<?php echo esc_attr( $origin ); ?>"
+            src="<?php echo esc_attr( $form_url ); ?>"
+            style="width:100%;border:1px solid rgba(0,0,0,0.1);border-radius:6px;display:block;"
+            height="<?php echo esc_attr( $height ); ?>"
+            scrolling="no"
+            allowfullscreen
+        ></iframe>
+        <?php
+        return ob_get_clean();
+    }
+
+    /**
+     * Validates that a string matches the bcrypt token format Wizlo emits.
+     * Pattern: $2[abxy]$NN$<53 chars of [A-Za-z0-9./]>
+     */
+    private function is_valid_token( $token ) {
+        if ( ! is_string( $token ) || $token === '' ) {
+            return false;
+        }
+        return (bool) preg_match( '#^\$2[abxy]\$\d{2}\$[A-Za-z0-9./]{53}$#', $token );
+    }
+
+    /**
+     * Returns the active Wizlo origin based on the environment option.
+     */
+    private function get_wizlo_origin() {
+        $env = get_option( self::OPTION_ENV, 'production' );
+        return $env === 'sandbox' ? 'https://uat.wizlo.com' : 'https://app.wizlo.com';
+    }
+
+    /**
+     * Prints the shared postMessage script once at wp_footer, only if at least
+     * one [wizlo_form] shortcode rendered during this request.
+     */
+    public function print_iframe_script_once() {
+
+        if ( ! $this->shortcode_was_used ) {
+            return;
+        }
+        ?>
+        <script>
+        (function () {
+          var iframesMap = new Map();
+
+          function getAffiliateId() {
+            // Primary: AffiliateWP cookie set by /join/<id>/ landing pages.
+            var m = document.cookie.match(/(?:^|;\s*)affwp_ref=([^;]+)/);
+            if (m) return decodeURIComponent(m[1]);
+            // Fallback: explicit URL parameter (useful for testing).
+            var p = new URLSearchParams(window.location.search).get('affiliate_id');
+            if (p) return p;
+            return null;
+          }
+
+          function findIframeBySource(source) {
+            var found = null;
+            iframesMap.forEach(function (state, iframe) {
+              if (iframe.contentWindow === source) {
+                found = { iframe: iframe, state: state };
+              }
+            });
+            return found;
+          }
+
+          function handleMessage(event) {
+            if (!event.data || !event.data.type) return;
+
+            var hit = findIframeBySource(event.source);
+            if (!hit) return; // not one of our iframes
+
+            var iframe = hit.iframe;
+            var state  = hit.state;
+
+            if (event.data.type === 'wizlo-form-resize' && typeof event.data.height === 'number') {
+              iframe.style.height = event.data.height + 'px';
+              return;
+            }
+
+            if (event.data.type === 'wizlo-form-ready' && !state.sent) {
+              state.sent = true;
+              var affId = getAffiliateId();
+              iframe.contentWindow.postMessage({
+                type: 'wizlo-form-init-patient',
+                patient: {
+                  email: '',
+                  customFields: {
+                    affiliate_id:     affId || '',
+                    affiliate_source: 'arsynl_wp',
+                    landing_url:      window.location.href
+                  }
+                }
+              }, state.origin);
+            }
+          }
+
+          window.addEventListener('message', handleMessage);
+
+          function registerIframes() {
+            var iframes = document.querySelectorAll('.wizlo-form-iframe');
+            for (var i = 0; i < iframes.length; i++) {
+              var f = iframes[i];
+              if (iframesMap.has(f)) continue;
+              iframesMap.set(f, {
+                sent: false,
+                origin: f.getAttribute('data-wizlo-origin') || 'https://app.wizlo.com'
+              });
+            }
+          }
+
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', registerIframes);
+          } else {
+            registerIframes();
+          }
+        })();
+        </script>
+        <?php
+    }
+
+    /* =====================================================================
      * Logging
      * ================================================================== */
 
@@ -674,6 +854,15 @@ class Wizlo_AffiliateWP_Bridge {
 
     public function register_settings() {
         register_setting( 'wizlo_bridge', self::OPTION_SECRET );
+        register_setting( 'wizlo_bridge', self::OPTION_ENV, array(
+            'type'              => 'string',
+            'sanitize_callback' => array( $this, 'sanitize_env' ),
+            'default'           => 'production',
+        ) );
+    }
+
+    public function sanitize_env( $value ) {
+        return in_array( $value, array( 'production', 'sandbox' ), true ) ? $value : 'production';
     }
 
     public function admin_page() {
@@ -695,7 +884,39 @@ class Wizlo_AffiliateWP_Bridge {
         );
         ?>
         <div class="wrap">
-            <h1>Wizlo → AffiliateWP Bridge <span style="font-size:13px;color:#666;">v2.1.0</span></h1>
+            <h1>Wizlo → AffiliateWP Bridge <span style="font-size:13px;color:#666;">v2.2.0</span></h1>
+
+            <h2>0. Environment</h2>
+            <form method="post" action="options.php">
+                <?php settings_fields( 'wizlo_bridge' ); ?>
+                <?php
+                $current_env  = get_option( self::OPTION_ENV, 'production' );
+                $current_host = $this->get_wizlo_origin();
+                ?>
+                <table class="form-table">
+                    <tr>
+                        <th scope="row">Wizlo Environment</th>
+                        <td>
+                            <label style="margin-right:18px;">
+                                <input type="radio" name="<?php echo esc_attr( self::OPTION_ENV ); ?>" value="production" <?php checked( $current_env, 'production' ); ?>>
+                                <strong>Production</strong> &nbsp;<code>https://app.wizlo.com</code>
+                            </label>
+                            <label>
+                                <input type="radio" name="<?php echo esc_attr( self::OPTION_ENV ); ?>" value="sandbox" <?php checked( $current_env, 'sandbox' ); ?>>
+                                <strong>Sandbox (UAT)</strong> &nbsp;<code>https://uat.wizlo.com</code>
+                            </label>
+                            <p class="description">
+                                Currently active: <code><?php echo esc_html( $current_host ); ?></code>.
+                                This determines which Wizlo domain the <code>[wizlo_form]</code> shortcode loads.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+
+                <?php
+                // We render the secret field inside the SAME form so both options
+                // save together. The secret block below is just decorative anchor.
+                ?>
 
             <h2>1. Webhook URL</h2>
             <p>Register this URL in Wizlo (<code>POST /tenant/webhooks</code>):</p>
@@ -711,8 +932,6 @@ class Wizlo_AffiliateWP_Bridge {
             </ul>
 
             <h2>3. HMAC Secret</h2>
-            <form method="post" action="options.php">
-                <?php settings_fields( 'wizlo_bridge' ); ?>
                 <table class="form-table">
                     <tr>
                         <th scope="row">Webhook Secret</th>
@@ -734,7 +953,50 @@ class Wizlo_AffiliateWP_Bridge {
                         </td>
                     </tr>
                 </table>
-                <?php submit_button(); ?>
+
+            <h2>4. Form Shortcode</h2>
+            <p>
+                Embed the Wizlo intake form anywhere with the <code>[wizlo_form]</code> shortcode.
+                It automatically reads the <code>affwp_ref</code> cookie set by AffiliateWP on
+                <code>/join/&lt;id&gt;/</code> pages and forwards it to Wizlo via <code>customFields</code>,
+                preserving affiliate attribution end-to-end.
+            </p>
+            <table class="form-table">
+                <tr>
+                    <th scope="row">Dynamic URL</th>
+                    <td>
+                        <code>https://your-site.com/intake/?token=&lt;wizlo-bcrypt-token&gt;</code>
+                        <p class="description">
+                            Create a single page (e.g. <code>/intake/</code>) containing
+                            <code>[wizlo_form]</code>. Point each WooCommerce product's external URL
+                            to this page with the appropriate <code>?token=</code>. The shortcode
+                            reads the token from the URL automatically.
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">Hardcoded Token</th>
+                    <td>
+                        <code>[wizlo_form token="$2b$12$..."]</code>
+                        <p class="description">
+                            Alternative: hardcode the token directly in the shortcode for a
+                            dedicated page (no URL parameters needed).
+                        </p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">Custom Height</th>
+                    <td>
+                        <code>[wizlo_form height="1200"]</code>
+                        <p class="description">
+                            Initial height in pixels. The iframe auto-resizes as the user
+                            advances through pages; this only controls the first paint.
+                        </p>
+                    </td>
+                </tr>
+            </table>
+
+                <?php submit_button( 'Save Settings' ); ?>
             </form>
 
             <h2 style="display:flex;justify-content:space-between;align-items:center;">
