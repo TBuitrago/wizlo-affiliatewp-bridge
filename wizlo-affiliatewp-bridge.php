@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Wizlo → AffiliateWP Bridge
  * Plugin URI:  https://github.com/TBuitrago/wizlo-affiliatewp-bridge
- * Description: Receives webhooks from Wizlo and creates referrals in AffiliateWP. Supports forms.coupon_used (primary), order.updated (lifecycle), and opportunistic affiliate_id detection in customFields/metadata.
- * Version:     2.0.0
+ * Description: Receives webhooks from Wizlo and creates referrals in AffiliateWP. Supports forms.coupon_used (primary), order.updated (lifecycle), and cookie-based attribution via forms.progress_saved + forms.completed.
+ * Version:     2.1.0
  * Author:      Tomas Buitrago
  * Author URI:  https://github.com/TBuitrago
  * Requires PHP: 7.4
@@ -110,6 +110,9 @@ class Wizlo_AffiliateWP_Bridge {
 
         switch ( $normalized ) {
 
+            case 'forms_progress_saved':
+                return $this->handle_progress_saved( $payload );
+
             case 'forms_coupon_used':
                 return $this->handle_coupon_used( $payload );
 
@@ -132,6 +135,55 @@ class Wizlo_AffiliateWP_Bridge {
     /* =====================================================================
      * Event handlers
      * ================================================================== */
+
+    /**
+     * forms.progress_saved — captures affiliate_id from customFields/partial_form_data
+     * and stores it keyed by session_id (transient, 30 days) so it can be looked up
+     * when forms.completed arrives (which does NOT carry partial_form_data).
+     */
+    private function handle_progress_saved( $payload ) {
+
+        $data = isset( $payload['data'] ) && is_array( $payload['data'] )
+            ? $payload['data']
+            : $payload;
+
+        $session_id = $this->find( $data, array( 'session_id', 'sessionId' ) );
+        if ( empty( $session_id ) ) {
+            return array( 'status' => 'no_session_id' );
+        }
+
+        $partial = isset( $data['partial_form_data'] ) && is_array( $data['partial_form_data'] )
+            ? $data['partial_form_data']
+            : array();
+
+        // First try partial_form_data (Wizlo flattens customFields here),
+        // then fall back to any other location in the payload.
+        $aff_raw = $this->find_affiliate_id_anywhere( $partial );
+        if ( empty( $aff_raw ) ) {
+            $aff_raw = $this->find_affiliate_id_anywhere( $payload );
+        }
+
+        if ( empty( $aff_raw ) ) {
+            return array( 'status' => 'no_affiliate_id_in_progress' );
+        }
+
+        set_transient(
+            'wizlo_session_aff_' . $session_id,
+            (string) $aff_raw,
+            30 * DAY_IN_SECONDS
+        );
+
+        $this->log( 'info', 'Session affiliate captured', array(
+            'session_id'   => $session_id,
+            'affiliate_id' => $aff_raw,
+        ) );
+
+        return array(
+            'status'       => 'session_stored',
+            'session_id'   => $session_id,
+            'affiliate_id' => $aff_raw,
+        );
+    }
 
     /**
      * forms.coupon_used — PRIMARY attribution event.
@@ -184,6 +236,21 @@ class Wizlo_AffiliateWP_Bridge {
             : $payload;
 
         $affiliate_id_raw = $this->find_affiliate_id_anywhere( $payload );
+
+        // Fallback: forms.completed does NOT carry partial_form_data — look up
+        // the affiliate_id captured earlier from forms.progress_saved (by session_id).
+        $source_label = 'forms_completed+customFields';
+        if ( empty( $affiliate_id_raw ) ) {
+            $session_id = $this->find( $data, array( 'session_id', 'sessionId' ) );
+            if ( $session_id ) {
+                $stored = get_transient( 'wizlo_session_aff_' . $session_id );
+                if ( ! empty( $stored ) ) {
+                    $affiliate_id_raw = $stored;
+                    $source_label = 'forms_completed+session_lookup';
+                }
+            }
+        }
+
         if ( ! $affiliate_id_raw ) {
             return array( 'status' => 'no_affiliate_id_in_payload' );
         }
@@ -206,7 +273,7 @@ class Wizlo_AffiliateWP_Bridge {
             'order_id'     => $order_id,
             'amount'       => 0,
             'email'        => $email,
-            'source'       => 'forms_completed+customFields',
+            'source'       => $source_label,
             'coupon'       => '',
         ) );
     }
@@ -266,19 +333,23 @@ class Wizlo_AffiliateWP_Bridge {
                 continue;
             }
 
-            // Backfill amount if created with 0 (forms.completed case without amount).
-            if ( $referral->amount == 0 && $grand_total !== null && $grand_total > 0 ) {
+            // Backfill amount if created with 0. We recalc even when grand_total is 0
+            // because a flat-rate affiliate should still earn their flat commission
+            // on a 100%-coupon order. affwp_calc_referral_amount handles both rate types.
+            if ( $referral->amount == 0 && $grand_total !== null ) {
                 $new_amount = function_exists( 'affwp_calc_referral_amount' )
                     ? affwp_calc_referral_amount( $grand_total, $referral->affiliate_id, $referral->referral_id, '', self::REF_CONTEXT )
                     : $grand_total;
-                affwp_update_referral( array(
-                    'referral_id' => $referral->referral_id,
-                    'amount'      => $new_amount,
-                ) );
-                $this->log( 'info', 'Referral amount backfilled', array(
-                    'referral_id' => $referral->referral_id,
-                    'amount'      => $new_amount,
-                ) );
+                if ( $new_amount > 0 ) {
+                    affwp_update_referral( array(
+                        'referral_id' => $referral->referral_id,
+                        'amount'      => $new_amount,
+                    ) );
+                    $this->log( 'info', 'Referral amount backfilled', array(
+                        'referral_id' => $referral->referral_id,
+                        'amount'      => $new_amount,
+                    ) );
+                }
             }
 
             $map = array(
@@ -346,7 +417,10 @@ class Wizlo_AffiliateWP_Bridge {
         }
 
         $amount = (float) $args['amount'];
-        $referral_amount = ( $amount > 0 && function_exists( 'affwp_calc_referral_amount' ) )
+
+        // Always call affwp_calc_referral_amount (when available) so flat-rate
+        // affiliates earn their flat commission even on $0 orders (e.g., 100% coupons).
+        $referral_amount = function_exists( 'affwp_calc_referral_amount' )
             ? affwp_calc_referral_amount( $amount, $args['affiliate_id'], 0, '', self::REF_CONTEXT )
             : $amount;
 
@@ -621,7 +695,7 @@ class Wizlo_AffiliateWP_Bridge {
         );
         ?>
         <div class="wrap">
-            <h1>Wizlo → AffiliateWP Bridge <span style="font-size:13px;color:#666;">v2.0.0</span></h1>
+            <h1>Wizlo → AffiliateWP Bridge <span style="font-size:13px;color:#666;">v2.1.0</span></h1>
 
             <h2>1. Webhook URL</h2>
             <p>Register this URL in Wizlo (<code>POST /tenant/webhooks</code>):</p>
@@ -630,8 +704,9 @@ class Wizlo_AffiliateWP_Bridge {
             <h2>2. Recommended Events</h2>
             <ul style="list-style:disc;padding-left:20px;">
                 <li><strong>forms.coupon_used</strong> — primary attribution (carries coupon, amount, order_id)</li>
-                <li><strong>order.updated</strong> (orders module) — transitions pending → unpaid → rejected</li>
-                <li><strong>forms.completed</strong> — optional, only if using iframe + customFields</li>
+                <li><strong>order.updated</strong> (orders module) — transitions pending → unpaid → rejected and amount backfill</li>
+                <li><strong>forms.progress_saved</strong> — required for cookie-based attribution: captures affiliate_id from customFields/partial_form_data, indexed by session_id</li>
+                <li><strong>forms.completed</strong> — pairs with progress_saved to create the pending referral on submit</li>
                 <li><strong>forms.product_selected</strong> — optional, alternative without coupon in <code>paid</code> state</li>
             </ul>
 
